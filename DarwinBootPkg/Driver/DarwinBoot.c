@@ -17,6 +17,8 @@
 #include "PackedRamdisk.h"
 #include "WindowSize.h"
 
+// The window only applies when the payload ADT has no /chosen/darwinboot-memory-size
+// (that property, when present, wins). H126c keeps the ADT value untouched.
 #define WINDOW_SIZE  SIZE_256MB
 #define BLOCK_SIZE   SIZE_2MB
 #define MAX_SEGMENTS 64
@@ -490,6 +492,43 @@ DiagDraw (CONST CHAR16 *Text, UINTN Row)
   }
 }
 
+//
+// H126c: the firmware console (Print) is not visible once the UniXNU menu owns
+// the screen, so draw the GIC handoff state with DiagDraw, the same direct
+// framebuffer path that shows the NO WINDOW/FREE lines. OnePlus 5 / MSM8998:
+// GICD 0x17A00000, GICR 0x17B00000, redistributor stride 0x20000.
+//
+STATIC
+UINT32
+GicRead32 (
+  UINTN  Base,
+  UINTN  Offset
+  )
+{
+  return *(volatile UINT32 *)(Base + Offset);
+}
+
+STATIC
+VOID
+DiagGic (
+  UINTN  Row
+  )
+{
+  CHAR16  Line[128];
+  UINTN   Dist = 0x17A00000;
+  UINTN   Rd   = 0x17B00000;
+  UINT32  Ctlr = GicRead32 (Dist, 0x0000);
+
+  UnicodeSPrint (
+    Line, sizeof (Line),
+    L"GIC CTLR=%08x DS=%d ARE=%d IGROUPR0=%08x ISEN=%08x ISPEND=%08x WAKER=%08x",
+    Ctlr, (Ctlr >> 6) & 1, (Ctlr >> 4) & 1,
+    GicRead32 (Rd, 0x10080), GicRead32 (Rd, 0x10100),
+    GicRead32 (Rd, 0x10280), GicRead32 (Rd, 0x0014)
+    );
+  DiagDraw (Line, Row);
+}
+
 STATIC
 EFI_STATUS
 AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address)
@@ -600,6 +639,7 @@ Boot (
   CHAR8                           CommandLine[1024];
   UINT64                          Video[6];
 
+  DiagGic (9);
   (VOID)This;
   if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
   if ((Request->KextCount != 0) || (Request->DeviceTree != NULL) || (Request->DeviceTreeSize != 0) ||
