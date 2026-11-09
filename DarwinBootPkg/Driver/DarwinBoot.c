@@ -797,6 +797,8 @@ Boot (
   UINTN                           PolicyOffset;
   UINT64                          PolicyAddress;
   UINT64                          ZapAddress;
+  UINT64                          ManagedEnd;
+  UINT64                          ManagedSize;
   LOW_ALLOC                       ZapAlloc;
   LOW_ALLOC                       ImageAlloc;
   LOW_ALLOC                       TreeAlloc;
@@ -949,24 +951,13 @@ Boot (
   if (EFI_ERROR (Status)) { goto Fail; }
 
   /*
-   * H236bv: reserve the ZAP image outside the XNU arena, using sagit's
-   * stageZap recipe (AllocateMaxAddress < 4 GiB, over-allocate by alignment,
-   * align inside the reservation, then UC/XP). The kernel maps this through
-   * zap-base; it is not part of the kernel window.
+   * H236cp: the ZAP is carved from the top of the kernel window after the
+   * window is allocated (below). H236bv put it in the low 4 GiB instead, but
+   * XNU frees everything between boot_args->topOfKernelData and
+   * physBase+memSize; once the memory budget covers the whole DRAM run
+   * (H236co jetsam panic with memSize = 192 MiB) a low ZAP would be handed
+   * out and overwritten before the GPU PAS transition.
    */
-  /*
-   * H236bw: keep the ZAP allocation WB/normal. The H236bv boot faulted at
-   * 0x17ABAC18 (a >4 GiB Image/Addon pool) after the UC|XP SetMemoryAttributes
-   * call; the kernel maps zap-base with kIOMapInhibitCache and cleans the
-   * .mdt/.b02 before PAS, so the boot-stage UC is not required for the probe.
-   */
-  Status = AllocateLow (2 * SIZE_1MB, SIZE_1MB, 0, TRUE, &ZapAlloc);
-  if (EFI_ERROR (Status)) {
-    UnicodeSPrint (Diag, sizeof (Diag), L"NO ZAP ALLOC %r", Status);
-    DiagDraw (Diag, 2);
-    gBS->Stall (15000000);
-    goto Fail;
-  }
 
   /*
    * Try 192 MiB first; if the firmware's per-call limit is 128 MiB, retry at
@@ -987,6 +978,48 @@ Boot (
     gBS->Stall (15000000);
     goto Fail;
   }
+  /*
+   * H236cp: reserve the ZAP in the top 2 MiB of the window. Address is the
+   * 2 MiB-aligned base plus the __TEXT 0x4000 offset, so align the carve-out
+   * down to 1 MiB and keep it below Address + WindowSize.
+   */
+  ZapAddress = (Address + WindowSize - (2 * SIZE_1MB)) & ~(UINT64)(SIZE_1MB - 1);
+  ZeroMem ((VOID *)(UINTN)ZapAddress, 2 * SIZE_1MB);
+  /*
+   * H236cp: XNU frees [topOfKernelData, physBase + memSize). Reserve the whole
+   * window and let memSize cover the rest of the DRAM run that contains it.
+   * memSize = WindowSize only left ~100 MiB for userspace and jetsam panicked
+   * with "no victim available pages" (H236co).
+   */
+  ManagedEnd = Address + WindowSize;
+  {
+    EFI_MEMORY_DESCRIPTOR *RunMap;
+    UINTN                  RunCapacity;
+    UINTN                  RunSize;
+    UINTN                  RunKey;
+    UINTN                  RunStride;
+    UINT32                 RunVersion;
+
+    RunMap = NULL;
+    RunCapacity = 0;
+    if (!EFI_ERROR (GetMap (&RunMap, &RunCapacity, &RunSize, &RunKey, &RunStride))) {
+      /*
+       * H236cr: only extend into the conventional descriptor that starts
+       * exactly at the end of our window. Taking the highest conventional end
+       * picks the DRAM above 4 GiB on this 8 GiB board and hands XNU a 7 GiB
+       * range with holes, which hangs the kernel before the console.
+       */
+      for (UINTN RunOffset = 0; RunOffset + RunStride <= RunSize; RunOffset += RunStride) {
+        EFI_MEMORY_DESCRIPTOR *Run = (EFI_MEMORY_DESCRIPTOR *)((UINT8 *)RunMap + RunOffset);
+        if ((Run->Type == EfiConventionalMemory) && (Run->PhysicalStart == Address + WindowSize)) {
+          ManagedEnd = Run->PhysicalStart + EFI_PAGES_TO_SIZE (Run->NumberOfPages);
+          break;
+        }
+      }
+      FreePool (RunMap);
+    }
+  }
+  ManagedSize = ManagedEnd - Address;
   /*
    * H236cl: the sidecars must stay inside the kernel window. XNU derives
    * gPhysBase/gPhysSize from boot_args->physBase/memSize, and NativeRamBlock
@@ -1051,8 +1084,16 @@ Boot (
     Used = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB) - Address;
   } else {
     RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, EFI_PAGE_SIZE);
-    RamdiskBytes = ALIGN_VALUE (KeepPacked ? Request->RamdiskSize : RamdiskExpandedSize, EFI_PAGE_SIZE);
-    TrustCacheAddress = RamdiskAddress + RamdiskBytes;
+    /*
+     * H236cn: a packed (DBRDISK1) seed must be handed over with its exact
+     * encoded length. NativeRamBlock's ramPackedLayout() requires the page
+     * runs to end exactly at the passed size (cursor == n), so the page
+     * alignment used for a dense ramdisk makes the packed import fail and
+     * leaves ready=0 (H236cm: "encoded=3223552" vs the file's 3219600).
+     */
+    RamdiskBytes = KeepPacked ? Request->RamdiskSize
+                              : ALIGN_VALUE (RamdiskExpandedSize, EFI_PAGE_SIZE);
+    TrustCacheAddress = ALIGN_VALUE (RamdiskAddress + RamdiskBytes, SIZE_16KB);
     if (Addon != NULL) {
       AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
       PolicyAddress = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB);
@@ -1065,7 +1106,7 @@ Boot (
                         ((AddonAddress != 0) ? (AddonAddress + AddonSize) :
                          (TrustCacheAddress + TrustCacheSize)), SIZE_16KB) - Address;
   }
-  if (Used > WindowSize - BLOCK_SIZE) {
+  if (Used > WindowSize - BLOCK_SIZE - (2 * SIZE_1MB)) {
     Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
     Status = EFI_BAD_BUFFER_SIZE;
     goto Fail;
@@ -1085,9 +1126,9 @@ Boot (
   Args->Version = 2;
   Args->VirtualBase = Kernel.Base;
   Args->PhysicalBase = Address;
-  Args->MemorySize = WindowSize;
-  Args->MemorySizeActual = WindowSize;
-  Args->TopOfKernelData = Address + Used;
+  Args->MemorySize = ManagedSize;
+  Args->MemorySizeActual = ManagedSize;
+  Args->TopOfKernelData = Address + WindowSize;
   CopyMem (Args->Video, Video, sizeof (Video));
   Args->DeviceTree = Kernel.Base + TreeAddress - Address;
   Args->DeviceTreeLength = (UINT32)TreeSize;
