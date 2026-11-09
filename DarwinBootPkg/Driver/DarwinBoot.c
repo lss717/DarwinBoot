@@ -936,8 +936,13 @@ Boot (
    * align inside the reservation, then UC/XP). The kernel maps this through
    * zap-base; it is not part of the kernel window.
    */
-  Status = AllocateLow (2 * SIZE_1MB, SIZE_1MB,
-                        EFI_MEMORY_UC | EFI_MEMORY_XP, TRUE, &ZapAlloc);
+  /*
+   * H236bw: keep the ZAP allocation WB/normal. The H236bv boot faulted at
+   * 0x17ABAC18 (a >4 GiB Image/Addon pool) after the UC|XP SetMemoryAttributes
+   * call; the kernel maps zap-base with kIOMapInhibitCache and cleans the
+   * .mdt/.b02 before PAS, so the boot-stage UC is not required for the probe.
+   */
+  Status = AllocateLow (2 * SIZE_1MB, SIZE_1MB, 0, TRUE, &ZapAlloc);
   if (EFI_ERROR (Status)) {
     UnicodeSPrint (Diag, sizeof (Diag), L"NO ZAP ALLOC %r", Status);
     DiagDraw (Diag, 2);
@@ -945,6 +950,10 @@ Boot (
     goto Fail;
   }
   ZapAddress = ZapAlloc.Address;
+  UnicodeSPrint (Diag, sizeof (Diag), L"ZAP LOW 0x%lx/0x%lx",
+                 ZapAddress, ZapAlloc.Raw);
+  DiagDraw (Diag, 4);
+  gBS->Stall (3000000);
 
   /*
    * Try 192 MiB first; if the firmware's per-call limit is 128 MiB, retry at
@@ -965,6 +974,10 @@ Boot (
     gBS->Stall (15000000);
     goto Fail;
   }
+  UnicodeSPrint (Diag, sizeof (Diag), L"WIN 0x%lx sz 0x%lx low %u",
+                 Address, (UINT64)WindowSize, LowSidecars ? 1 : 0);
+  DiagDraw (Diag, 5);
+  gBS->Stall (3000000);
   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
   if (LowSidecars) {
@@ -1027,6 +1040,10 @@ Boot (
     PolicyAddress = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB);
     Used = ALIGN_VALUE (PolicyAddress + PolicySize, SIZE_16KB) - Address;
   }
+  UnicodeSPrint (Diag, sizeof (Diag), L"IMG 0x%lx ADD 0x%lx POL 0x%lx RAM 0x%lx",
+                 (UINT64)(UINTN)Image, AddonAddress, PolicyAddress, RamdiskAddress);
+  DiagDraw (Diag, 6);
+  gBS->Stall (3000000);
   if (Used > WindowSize - BLOCK_SIZE) {
     Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
     Status = EFI_BAD_BUFFER_SIZE;
@@ -1085,6 +1102,8 @@ Boot (
       FreePool (Policies); Policies = NULL;
     }
   }
+  DiagDraw (L"COPY DONE", 7);
+  gBS->Stall (3000000);
   FreePool (Image); Image = NULL;
   FreePool (Tree); Tree = NULL;
   FreePool (TreePath); TreePath = NULL;
