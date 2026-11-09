@@ -628,6 +628,7 @@ Boot (
   UINTN                           PolicySize;
   UINTN                           PolicyOffset;
   UINT64                          PolicyAddress;
+  UINT64                          ZapAddress;
   DARWIN_BOOT_ARGS                *Args;
   EFI_MEMORY_DESCRIPTOR           *Map;
   UINTN                           Capacity;
@@ -768,7 +769,20 @@ Boot (
   TrustCacheAddress = RamdiskAddress + RamdiskBytes;
   AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
   PolicyAddress = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB);
-  Used = ALIGN_VALUE (PolicyAddress + PolicySize, SIZE_16KB) - Address;
+  /*
+   * The A540 ZAP image (.b02, p_align=1 MiB) is authenticated by PAS, which
+   * requires a below-4G, 1 MiB-aligned physical buffer (sagit stageZap()).
+   * Keep it inside the kernel window so XNU's boot_args.MemorySize and
+   * TopOfKernelData already reserve it; there is no separate EFI allocation
+   * for XNU to reclaim.
+   */
+  ZapAddress = ALIGN_VALUE (PolicyAddress + PolicySize, SIZE_1MB);
+  if ((ZapAddress < PolicyAddress) || (ZapAddress + 2 * SIZE_1MB > 0x100000000ULL)) {
+    Print (L"DARWINBOOT: no low ZAP window (policy=0x%lx)\n", PolicyAddress);
+    Status = EFI_BAD_BUFFER_SIZE;
+    goto Fail;
+  }
+  Used = ALIGN_VALUE (ZapAddress + 2 * SIZE_1MB, SIZE_16KB) - Address;
   if (Used > WindowSize - BLOCK_SIZE) {
     Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
     Status = EFI_BAD_BUFFER_SIZE;
@@ -790,6 +804,11 @@ Boot (
   CopyMem (Args->Video, Video, sizeof (Video));
   Args->DeviceTree = Kernel.Base + TreeAddress - Address;
   Args->DeviceTreeLength = (UINT32)TreeSize;
+  if (AsciiStrLen (CommandLine) + 32 < sizeof (CommandLine)) {
+    AsciiSPrint (CommandLine + AsciiStrLen (CommandLine),
+                 sizeof (CommandLine) - AsciiStrLen (CommandLine),
+                 " zap-base=0x%lx", ZapAddress);
+  }
   CopyMem (Args->CommandLine, CommandLine, sizeof (CommandLine));
   CopyMem ((VOID *)(UINTN)TreeAddress, Tree, TreeSize);
   if (Request->Ramdisk != NULL) {
@@ -826,6 +845,7 @@ Boot (
          Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
   Print (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
          Video[0], Video[1], Video[2], Video[3], Video[4], Video[5]);
+  Print (L"DARWINBOOT: zap base=0x%lx size=0x%lx\n", ZapAddress, (UINT64)(2 * SIZE_1MB));
   Print (L"DARWINBOOT: command line: %a\n", CommandLine);
   Print (L"DARWINBOOT: inputs validated; exiting boot services\n");
 
