@@ -988,11 +988,13 @@ Boot (
     goto Fail;
   }
   /*
-   * H236cc: keep the 192 MiB window for the kernel/args/ADT/trust only.
-   * The ramdisk/addon/policy go low via AllocateLow even when 192 succeeds,
-   * leaving ~139 MiB of early XNU boot memory instead of ~24 MiB.
+   * H236cl: the sidecars must stay inside the kernel window. XNU derives
+   * gPhysBase/gPhysSize from boot_args->physBase/memSize, and NativeRamBlock
+   * refuses a seed outside that range (H236ck: an out-of-window ramdisk made
+   * the scratch Data mount wait 55 s and then panic with ENOENT). Keep the
+   * H236bw behaviour: a 192 MiB window carries kernel/args/ADT/trust and the
+   * sidecars; only the 128 MiB fallback moves them low.
    */
-  LowSidecars = TRUE;
   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
   if (LowSidecars) {
