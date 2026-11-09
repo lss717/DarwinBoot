@@ -958,9 +958,6 @@ Boot (
     gBS->Stall (15000000);
     goto Fail;
   }
-  ZapAddress = ZapAlloc.Address;
-  UnicodeSPrint (Diag, sizeof (Diag), L"ZAP LOW 0x%lx/0x%lx",
-                 ZapAddress, ZapAlloc.Raw);
 
   /*
    * Try 192 MiB first; if the firmware's per-call limit is 128 MiB, retry at
@@ -981,8 +978,6 @@ Boot (
     gBS->Stall (15000000);
     goto Fail;
   }
-  UnicodeSPrint (Diag, sizeof (Diag), L"WIN 0x%lx sz 0x%lx low %u",
-                 Address, (UINT64)WindowSize, LowSidecars ? 1 : 0);
   /*
    * H236cc: keep the 192 MiB window for the kernel/args/ADT/trust only.
    * The ramdisk/addon/policy go low via AllocateLow even when 192 succeeds,
@@ -1059,10 +1054,6 @@ Boot (
                         ((AddonAddress != 0) ? (AddonAddress + AddonSize) :
                          (TrustCacheAddress + TrustCacheSize)), SIZE_16KB) - Address;
   }
-  UnicodeSPrint (Diag, sizeof (Diag), L"IMG 0x%lx ADD 0x%lx POL 0x%lx RAM 0x%lx",
-                 (UINT64)(UINTN)Image, AddonAddress, PolicyAddress, RamdiskAddress);
-  UnicodeSPrint (Diag, sizeof (Diag), L"USED 0x%lx LIM 0x%lx",
-                 Used, Address + WindowSize);
   if (Used > WindowSize - BLOCK_SIZE) {
     Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
     Status = EFI_BAD_BUFFER_SIZE;
