@@ -564,11 +564,9 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
     if (RunBytes > BestBytes) { BestBytes = RunBytes; BestStart = Descriptor->PhysicalStart; }
     Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, BLOCK_SIZE) + (Kernel->Base & (BLOCK_SIZE - 1));
     if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate) || (End - Candidate < WindowSize)) { continue; }
-    /*
-     * The window itself may cross 4 GiB (owned_memory_size is 4 GiB), but its
-     * start and the ZAP area near the beginning must be below 4 GiB.
-     */
-    if (Candidate >= 0x100000000ULL) { continue; }
+    /* Keep the 4 GiB kernel window above 4 GiB so the separate low ZAP
+     * allocation cannot fall inside the VM-owned window. */
+    if (Candidate < 0x100000000ULL) { continue; }
     Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
     if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
   }
@@ -588,6 +586,53 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
   }
   FreePool (Map);
   return Status;
+}
+
+/*
+ * Separate low ZAP window. The 4 GiB kernel window starts above 4 GiB; XNU's
+ * VM owns [TopOfKernelData, PhysicalBase + MemorySize), so a low allocation
+ * outside that range is not reused. Over-allocate by 1 MiB and align the
+ * physical base for the a540 .b02 p_align.
+ */
+STATIC
+EFI_STATUS
+AllocateZapWindow (
+  EFI_PHYSICAL_ADDRESS  *Address,
+  UINT64                Size
+  )
+{
+  EFI_STATUS            Status;
+  EFI_PHYSICAL_ADDRESS  Limit;
+  EFI_PHYSICAL_ADDRESS  Candidate;
+  UINT64                Aligned;
+  UINTN                 Pages;
+
+  if ((Address == NULL) || (Size == 0) || (Size > SIZE_1MB * 2) ||
+      (Size & EFI_PAGE_MASK) != 0) {
+    return EFI_INVALID_PARAMETER;
+  }
+  Pages = EFI_SIZE_TO_PAGES (Size + SIZE_1MB);
+  Limit = 0xFFFFFFFFULL;
+  for (UINTN Attempt = 0; Attempt < 64; Attempt++) {
+    Candidate = Limit;
+    Status = gBS->AllocatePages (AllocateMaxAddress, EfiLoaderData, Pages, &Candidate);
+    if (EFI_ERROR (Status)) {
+      return Status;
+    }
+    Aligned = ALIGN_VALUE (Candidate, SIZE_1MB);
+    if ((Aligned >= Candidate) && (Aligned + Size <= 0x100000000ULL) &&
+        ((Aligned - Candidate) + Size <= EFI_PAGES_TO_SIZE (Pages))) {
+      ZeroMem ((VOID *)(UINTN)Aligned, (UINTN)Size);
+      *Address = Aligned;
+      return EFI_SUCCESS;
+    }
+    gBS->FreePages (Candidate, Pages);
+    if (Candidate < SIZE_1MB) {
+      break;
+    }
+    Limit = Candidate - 1;
+  }
+  return EFI_OUT_OF_RESOURCES;
 }
 
 STATIC
@@ -777,17 +822,17 @@ Boot (
   /*
    * The A540 ZAP image (.b02, p_align=1 MiB) is authenticated by PAS, which
    * requires a below-4G, 1 MiB-aligned physical buffer (sagit stageZap()).
-   * Keep it inside the kernel window so XNU's boot_args.MemorySize and
-   * TopOfKernelData already reserve it; there is no separate EFI allocation
-   * for XNU to reclaim.
+   * The 4 GiB kernel window starts above 4 GiB; this low allocation is
+   * outside XNU's VM-owned [TopOfKernelData, PhysicalBase+MemorySize) range.
    */
-  ZapAddress = ALIGN_VALUE (PolicyAddress + PolicySize, SIZE_1MB);
-  if ((ZapAddress < PolicyAddress) || (ZapAddress + 2 * SIZE_1MB > 0x100000000ULL)) {
-    Print (L"DARWINBOOT: no low ZAP window (policy=0x%lx)\n", PolicyAddress);
+  Status = AllocateZapWindow (&ZapAddress, 2 * SIZE_1MB);
+  if (EFI_ERROR (Status) || (ZapAddress + 2 * SIZE_1MB > Address)) {
+    Print (L"DARWINBOOT: no low ZAP allocation (%r) base=0x%lx kernel=0x%lx\n",
+           Status, ZapAddress, Address);
     Status = EFI_BAD_BUFFER_SIZE;
     goto Fail;
   }
-  Used = ALIGN_VALUE (ZapAddress + 2 * SIZE_1MB, SIZE_16KB) - Address;
+  Used = ALIGN_VALUE (PolicyAddress + PolicySize, SIZE_16KB) - Address;
   if (Used > WindowSize - BLOCK_SIZE) {
     Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
     Status = EFI_BAD_BUFFER_SIZE;
