@@ -689,6 +689,7 @@ Boot (
   UINTN                           Attempt;
   CHAR8                           CommandLine[1024];
   UINT64                          Video[6];
+  CHAR16                          Diag[96];
 
   DiagGic (9);
   (VOID)This;
@@ -811,7 +812,12 @@ Boot (
   Status = ReadBootVideo (Video);
   if (EFI_ERROR (Status)) { goto Fail; }
   Status = AllocateWindow (&Kernel, WindowSize, &Address);
-  if (EFI_ERROR (Status)) { goto Fail; }
+  if (EFI_ERROR (Status)) {
+    UnicodeSPrint (Diag, sizeof (Diag), L"NO KERNEL WINDOW %r size=0x%lx", Status, WindowSize);
+    DiagDraw (Diag, 1);
+    gBS->Stall (15000000);
+    goto Fail;
+  }
   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
   RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, EFI_PAGE_SIZE);
@@ -829,6 +835,10 @@ Boot (
   if (EFI_ERROR (Status) || (ZapAddress + 2 * SIZE_1MB > Address)) {
     Print (L"DARWINBOOT: no low ZAP allocation (%r) base=0x%lx kernel=0x%lx\n",
            Status, ZapAddress, Address);
+    UnicodeSPrint (Diag, sizeof (Diag), L"NO ZAP %r base=0x%lx kernel=0x%lx",
+                   Status, ZapAddress, Address);
+    DiagDraw (Diag, 2);
+    gBS->Stall (15000000);
     Status = EFI_BAD_BUFFER_SIZE;
     goto Fail;
   }
