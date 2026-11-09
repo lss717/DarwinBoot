@@ -524,11 +524,20 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
    * that run directly before falling back to the map walk.
    */
   {
-    static const UINT64 Fixed[] = { 0xA0000000ULL, 0xA0004000ULL, 0x100000000ULL, 0x180000000ULL };
+    static const UINT64 Fixed[] = { 0xA0000000ULL, 0x100000000ULL, 0x180000000ULL };
     static const EFI_MEMORY_TYPE Types[] = { EfiLoaderCode, EfiLoaderData };
     for (UINTN TypeIndex = 0; TypeIndex < sizeof (Types) / sizeof (Types[0]); TypeIndex++) {
       for (UINTN FixedIndex = 0; FixedIndex < sizeof (Fixed) / sizeof (Fixed[0]); FixedIndex++) {
-        Candidate = Fixed[FixedIndex];
+        /*
+         * H236cj: XNU's start_first_cpu builds its initial page tables with
+         * 2 MiB blocks, so the physical base must carry the same offset inside
+         * a 2 MiB block as the Mach-O __TEXT address (0x4000). Loading at
+         * 0xA0000000 instead of 0xA0004000 faults right after SCTLR_EL1.M is
+         * set: the kernel reaches the pre-MMU probe and then never calls
+         * arm_init. Bias every fixed candidate like the map walk below does.
+         */
+        Candidate = ALIGN_VALUE (Fixed[FixedIndex], BLOCK_SIZE) +
+                    (Kernel->Base & (BLOCK_SIZE - 1));
         Status = gBS->AllocatePages (AllocateAddress, Types[TypeIndex],
                                      EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
         if (!EFI_ERROR (Status)) {
