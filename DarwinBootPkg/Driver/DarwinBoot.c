@@ -532,8 +532,6 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
         Status = gBS->AllocatePages (AllocateAddress, Types[TypeIndex],
                                      EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
         if (!EFI_ERROR (Status)) {
-          Print (L"DARWINBOOT: fixed window type=%u base=0x%lx\n",
-                 (UINT32)TypeIndex, Candidate);
           *Address = Candidate;
           return EFI_SUCCESS;
         }
@@ -696,8 +694,6 @@ AllocateLow (
     Alloc->Total = Total;
     Alloc->Address = Aligned;
     Alloc->Usable = Usable;
-    Print (L"DARWINBOOT: low alloc base=0x%lx raw=0x%lx total=0x%lx\n",
-           Aligned, Raw, Total);
     return EFI_SUCCESS;
   }
   return EFI_OUT_OF_RESOURCES;
