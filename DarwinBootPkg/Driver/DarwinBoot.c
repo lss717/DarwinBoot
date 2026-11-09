@@ -564,6 +564,11 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
     if (RunBytes > BestBytes) { BestBytes = RunBytes; BestStart = Descriptor->PhysicalStart; }
     Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, BLOCK_SIZE) + (Kernel->Base & (BLOCK_SIZE - 1));
     if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate) || (End - Candidate < WindowSize)) { continue; }
+    /*
+     * The window itself may cross 4 GiB (owned_memory_size is 4 GiB), but its
+     * start and the ZAP area near the beginning must be below 4 GiB.
+     */
+    if (Candidate >= 0x100000000ULL) { continue; }
     Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
     if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
   }
