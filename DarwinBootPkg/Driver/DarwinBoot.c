@@ -546,6 +546,10 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
   UINT64                BestStart;
   UINT64                BestBytes;
   UINT64                RunBytes;
+  UINT64                Total;
+  UINT64                Aligned;
+  EFI_PHYSICAL_ADDRESS  Raw;
+  EFI_PHYSICAL_ADDRESS  Limit;
 
   *Address = 0;
   Map = NULL;
@@ -564,11 +568,33 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
     if (RunBytes > BestBytes) { BestBytes = RunBytes; BestStart = Descriptor->PhysicalStart; }
     Candidate = ALIGN_VALUE (Descriptor->PhysicalStart, BLOCK_SIZE) + (Kernel->Base & (BLOCK_SIZE - 1));
     if ((Candidate < Descriptor->PhysicalStart) || (End < Candidate) || (End - Candidate < WindowSize)) { continue; }
-    /* Keep the 4 GiB kernel window above 4 GiB so the separate low ZAP
-     * allocation cannot fall inside the VM-owned window. */
-    if (Candidate < 0x100000000ULL) { continue; }
     Status = gBS->AllocatePages (AllocateAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (WindowSize), &Candidate);
     if (!EFI_ERROR (Status)) { *Address = Candidate; break; }
+  }
+  /*
+   * H236bq: the exact per-run AllocateAddress can be rejected by the firmware
+   * even when the run is large enough. Fall back to AllocateMaxAddress and
+   * align the base inside the allocation (sagit stageZap's model). The block
+   * and the window must remain below 4 GiB so the ZAP stays low.
+   */
+  if (EFI_ERROR (Status)) {
+    Total = WindowSize + BLOCK_SIZE;
+    Limit = 0xFFFFFFFFULL;
+    for (UINTN Attempt = 0; Attempt < 64; Attempt++) {
+      Raw = Limit;
+      Status = gBS->AllocatePages (AllocateMaxAddress, EfiLoaderCode, EFI_SIZE_TO_PAGES (Total), &Raw);
+      if (EFI_ERROR (Status)) { break; }
+      Aligned = ALIGN_VALUE (Raw, BLOCK_SIZE) + (Kernel->Base & (BLOCK_SIZE - 1));
+      if ((Aligned >= Raw) && ((Aligned - Raw) <= Total) &&
+          (WindowSize <= Total - (Aligned - Raw)) && (Aligned + WindowSize <= 0x100000000ULL)) {
+        *Address = Aligned;
+        Status = EFI_SUCCESS;
+        break;
+      }
+      gBS->FreePages (Raw, EFI_SIZE_TO_PAGES (Total));
+      if (Raw < BLOCK_SIZE) { break; }
+      Limit = Raw - 1;
+    }
   }
   if (EFI_ERROR (Status)) {
     CHAR16 Line[96];
@@ -586,53 +612,6 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
   }
   FreePool (Map);
   return Status;
-}
-
-/*
- * Separate low ZAP window. The 4 GiB kernel window starts above 4 GiB; XNU's
- * VM owns [TopOfKernelData, PhysicalBase + MemorySize), so a low allocation
- * outside that range is not reused. Over-allocate by 1 MiB and align the
- * physical base for the a540 .b02 p_align.
- */
-STATIC
-EFI_STATUS
-AllocateZapWindow (
-  EFI_PHYSICAL_ADDRESS  *Address,
-  UINT64                Size
-  )
-{
-  EFI_STATUS            Status;
-  EFI_PHYSICAL_ADDRESS  Limit;
-  EFI_PHYSICAL_ADDRESS  Candidate;
-  UINT64                Aligned;
-  UINTN                 Pages;
-
-  if ((Address == NULL) || (Size == 0) || (Size > SIZE_1MB * 2) ||
-      (Size & EFI_PAGE_MASK) != 0) {
-    return EFI_INVALID_PARAMETER;
-  }
-  Pages = EFI_SIZE_TO_PAGES (Size + SIZE_1MB);
-  Limit = 0xFFFFFFFFULL;
-  for (UINTN Attempt = 0; Attempt < 64; Attempt++) {
-    Candidate = Limit;
-    Status = gBS->AllocatePages (AllocateMaxAddress, EfiLoaderData, Pages, &Candidate);
-    if (EFI_ERROR (Status)) {
-      return Status;
-    }
-    Aligned = ALIGN_VALUE (Candidate, SIZE_1MB);
-    if ((Aligned >= Candidate) && (Aligned + Size <= 0x100000000ULL) &&
-        ((Aligned - Candidate) + Size <= EFI_PAGES_TO_SIZE (Pages))) {
-      ZeroMem ((VOID *)(UINTN)Aligned, (UINTN)Size);
-      *Address = Aligned;
-      return EFI_SUCCESS;
-    }
-    gBS->FreePages (Candidate, Pages);
-    if (Candidate < SIZE_1MB) {
-      break;
-    }
-    Limit = Candidate - 1;
-  }
-  return EFI_OUT_OF_RESOURCES;
 }
 
 STATIC
@@ -826,23 +805,20 @@ Boot (
   AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
   PolicyAddress = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB);
   /*
-   * The A540 ZAP image (.b02, p_align=1 MiB) is authenticated by PAS, which
-   * requires a below-4G, 1 MiB-aligned physical buffer (sagit stageZap()).
-   * The 4 GiB kernel window starts above 4 GiB; this low allocation is
-   * outside XNU's VM-owned [TopOfKernelData, PhysicalBase+MemorySize) range.
+   * The A540 ZAP image (.b02, p_align=1 MiB) needs a below-4G, 1 MiB-aligned
+   * physical buffer. Keep it in the kernel window, before TopOfKernelData;
+   * the window itself may start low and cross 4 GiB.
    */
-  Status = AllocateZapWindow (&ZapAddress, 2 * SIZE_1MB);
-  if (EFI_ERROR (Status) || (ZapAddress + 2 * SIZE_1MB > Address)) {
-    Print (L"DARWINBOOT: no low ZAP allocation (%r) base=0x%lx kernel=0x%lx\n",
-           Status, ZapAddress, Address);
-    UnicodeSPrint (Diag, sizeof (Diag), L"NO ZAP %r base=0x%lx kernel=0x%lx",
-                   Status, ZapAddress, Address);
+  ZapAddress = ALIGN_VALUE (PolicyAddress + PolicySize, SIZE_1MB);
+  if ((ZapAddress < PolicyAddress) || (ZapAddress + 2 * SIZE_1MB > 0x100000000ULL)) {
+    UnicodeSPrint (Diag, sizeof (Diag), L"NO ZAP base=0x%lx policy=0x%lx",
+                   ZapAddress, PolicyAddress);
     DiagDraw (Diag, 2);
     gBS->Stall (15000000);
     Status = EFI_BAD_BUFFER_SIZE;
     goto Fail;
   }
-  Used = ALIGN_VALUE (PolicyAddress + PolicySize, SIZE_16KB) - Address;
+  Used = ALIGN_VALUE (ZapAddress + 2 * SIZE_1MB, SIZE_16KB) - Address;
   if (Used > WindowSize - BLOCK_SIZE) {
     Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
     Status = EFI_BAD_BUFFER_SIZE;
