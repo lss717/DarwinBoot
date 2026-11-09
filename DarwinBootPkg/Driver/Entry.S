@@ -9,10 +9,11 @@ ASM_FUNC(DarwinCurrentEl)
 // PA (0 for none), x5=its size in bytes. EL1 only.
 ASM_FUNC(DarwinEnter)
   msr daifset, #15
-  // Paint the top 1/16 of the framebuffer green (BGRA 0xFF00FF00)
-  // before cache maintenance, MMU shutdown and the branch to the kernel.
+  // Handoff checkpoint: a thin green band at the very top of the frame buffer.
+  // It is overwritten as soon as the kernel owns the display; if it survives,
+  // ExitBootServices returned and the branch below is where the boot stopped.
   cbz x4, 2f
-  lsr x9, x5, #4
+  lsr x9, x5, #7
   bic x9, x9, #7
   mov w10, #0xFF00
   movk w10, #0xFF00, lsl #16

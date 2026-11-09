@@ -493,43 +493,6 @@ DiagDraw (CONST CHAR16 *Text, UINTN Row)
   }
 }
 
-//
-// H126c: the firmware console (Print) is not visible once the UniXNU menu owns
-// the screen, so draw the GIC handoff state with DiagDraw, the same direct
-// framebuffer path that shows the NO WINDOW/FREE lines. OnePlus 5 / MSM8998:
-// GICD 0x17A00000, GICR 0x17B00000, redistributor stride 0x20000.
-//
-STATIC
-UINT32
-GicRead32 (
-  UINTN  Base,
-  UINTN  Offset
-  )
-{
-  return *(volatile UINT32 *)(Base + Offset);
-}
-
-STATIC
-VOID
-DiagGic (
-  UINTN  Row
-  )
-{
-  CHAR16  Line[128];
-  UINTN   Dist = 0x17A00000;
-  UINTN   Rd   = 0x17B00000;
-  UINT32  Ctlr = GicRead32 (Dist, 0x0000);
-
-  UnicodeSPrint (
-    Line, sizeof (Line),
-    L"GIC CTLR=%08x DS=%d ARE=%d IGROUPR0=%08x ISEN=%08x ISPEND=%08x WAKER=%08x",
-    Ctlr, (Ctlr >> 6) & 1, (Ctlr >> 4) & 1,
-    GicRead32 (Rd, 0x10080), GicRead32 (Rd, 0x10100),
-    GicRead32 (Rd, 0x10280), GicRead32 (Rd, 0x0014)
-    );
-  DiagDraw (Line, Row);
-}
-
 STATIC
 EFI_STATUS
 AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address)
@@ -742,6 +705,51 @@ AllocateLow (
 
 STATIC
 EFI_STATUS
+ReadFileLow (
+  EFI_FILE_PROTOCOL *Root,
+  CONST CHAR16      *Path,
+  UINTN             Limit,
+  VOID              **Data,
+  UINTN             *Size,
+  LOW_ALLOC         *Alloc
+  )
+{
+  EFI_STATUS         Status;
+  EFI_FILE_PROTOCOL  *File;
+  EFI_FILE_INFO      *Info;
+  UINTN              InfoSize;
+  UINTN              ReadSize;
+
+  if ((Root == NULL) || (Path == NULL) || (Data == NULL) || (Size == NULL) || (Alloc == NULL)) {
+    return EFI_INVALID_PARAMETER;
+  }
+  *Data = NULL;
+  *Size = 0;
+  Status = Root->Open (Root, &File, (CHAR16 *)Path, EFI_FILE_MODE_READ, 0);
+  if (EFI_ERROR (Status)) { return Status; }
+  InfoSize = SIZE_OF_EFI_FILE_INFO + 512;
+  Info = AllocatePool (InfoSize);
+  if (Info == NULL) { File->Close (File); return EFI_OUT_OF_RESOURCES; }
+  Status = File->GetInfo (File, &gEfiFileInfoGuid, &InfoSize, Info);
+  if (EFI_ERROR (Status)) { FreePool (Info); File->Close (File); return Status; }
+  if (Info->FileSize > Limit) { FreePool (Info); File->Close (File); return EFI_BAD_BUFFER_SIZE; }
+  Status = AllocateLow (Info->FileSize, EFI_PAGE_SIZE, 0, FALSE, Alloc);
+  if (EFI_ERROR (Status)) { FreePool (Info); File->Close (File); return Status; }
+  ReadSize = Info->FileSize;
+  Status = File->Read (File, &ReadSize, (VOID *)(UINTN)Alloc->Address);
+  FreePool (Info);
+  File->Close (File);
+  if (EFI_ERROR (Status) || (ReadSize != Alloc->Usable)) {
+    FreeLow (Alloc);
+    return EFI_ERROR (Status) ? Status : EFI_BAD_BUFFER_SIZE;
+  }
+  *Data = (VOID *)(UINTN)Alloc->Address;
+  *Size = ReadSize;
+  return EFI_SUCCESS;
+}
+
+STATIC
+EFI_STATUS
 EFIAPI
 Boot (
   IN UNIXNU_LOADER_PROTOCOL    *This,
@@ -785,6 +793,9 @@ Boot (
   UINT64                          PolicyAddress;
   UINT64                          ZapAddress;
   LOW_ALLOC                       ZapAlloc;
+  LOW_ALLOC                       ImageAlloc;
+  LOW_ALLOC                       TreeAlloc;
+  LOW_ALLOC                       TrustAlloc;
   LOW_ALLOC                       RamdiskAlloc;
   LOW_ALLOC                       AddonAlloc;
   LOW_ALLOC                       PolicyAlloc;
@@ -802,7 +813,6 @@ Boot (
   UINT64                          Video[6];
   CHAR16                          Diag[96];
 
-  DiagGic (9);
   (VOID)This;
   if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
   if ((Request->KextCount != 0) || (Request->DeviceTree != NULL) || (Request->DeviceTreeSize != 0) ||
@@ -837,6 +847,9 @@ Boot (
   Address = 0;
   Capacity = 0;
   ZeroMem (&ZapAlloc, sizeof (ZapAlloc));
+  ZeroMem (&ImageAlloc, sizeof (ImageAlloc));
+  ZeroMem (&TreeAlloc, sizeof (TreeAlloc));
+  ZeroMem (&TrustAlloc, sizeof (TrustAlloc));
   ZeroMem (&RamdiskAlloc, sizeof (RamdiskAlloc));
   ZeroMem (&AddonAlloc, sizeof (AddonAlloc));
   ZeroMem (&PolicyAlloc, sizeof (PolicyAlloc));
@@ -846,7 +859,7 @@ Boot (
   if (EFI_ERROR (Status)) { return Status; }
   Status = Fs->OpenVolume (Fs, &Root);
   if (EFI_ERROR (Status)) { return Status; }
-  Status = ReadFile (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize);
+  Status = ReadFileLow (Root, Request->KernelPath, SIZE_128MB, &Image, &ImageSize, &ImageAlloc);
   if (EFI_ERROR (Status)) { goto Fail; }
   Status = ParseKernel (Image, ImageSize, &Kernel);
   if (EFI_ERROR (Status)) { goto Fail; }
@@ -855,7 +868,7 @@ Boot (
   if (TreePath == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Fail; }
   CopyMem (TreePath, Request->KernelPath, Length);
   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".adt");
-  Status = ReadFile (Root, TreePath, SIZE_16MB, &Tree, &TreeSize);
+  Status = ReadFileLow (Root, TreePath, SIZE_16MB, &Tree, &TreeSize, &TreeAlloc);
   if (EFI_ERROR (Status)) { goto Fail; }
   Offset = 0;
   RamdiskOffset = MAX_UINTN;
@@ -878,7 +891,7 @@ Boot (
   }
   CopyMem (TreePath, Request->KernelPath, Length);
   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".trustcache");
-  Status = ReadFile (Root, TreePath, SIZE_16MB, &TrustCaches, &TrustCacheSize);
+  Status = ReadFileLow (Root, TreePath, SIZE_16MB, &TrustCaches, &TrustCacheSize, &TrustAlloc);
   if (EFI_ERROR (Status) && (Status != EFI_NOT_FOUND)) { goto Fail; }
   if (TrustCaches != NULL) {
     if ((TrustCacheOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + TrustCacheOffset) != 0) ||
@@ -952,8 +965,6 @@ Boot (
   ZapAddress = ZapAlloc.Address;
   UnicodeSPrint (Diag, sizeof (Diag), L"ZAP LOW 0x%lx/0x%lx",
                  ZapAddress, ZapAlloc.Raw);
-  DiagDraw (Diag, 4);
-  gBS->Stall (3000000);
 
   /*
    * Try 192 MiB first; if the firmware's per-call limit is 128 MiB, retry at
@@ -976,8 +987,12 @@ Boot (
   }
   UnicodeSPrint (Diag, sizeof (Diag), L"WIN 0x%lx sz 0x%lx low %u",
                  Address, (UINT64)WindowSize, LowSidecars ? 1 : 0);
-  DiagDraw (Diag, 5);
-  gBS->Stall (3000000);
+  /*
+   * H236cc: keep the 192 MiB window for the kernel/args/ADT/trust only.
+   * The ramdisk/addon/policy go low via AllocateLow even when 192 succeeds,
+   * leaving ~139 MiB of early XNU boot memory instead of ~24 MiB.
+   */
+  LowSidecars = TRUE;
   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
   if (LowSidecars) {
@@ -1036,23 +1051,36 @@ Boot (
     RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, EFI_PAGE_SIZE);
     RamdiskBytes = ALIGN_VALUE (KeepPacked ? Request->RamdiskSize : RamdiskExpandedSize, EFI_PAGE_SIZE);
     TrustCacheAddress = RamdiskAddress + RamdiskBytes;
-    AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
-    PolicyAddress = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB);
-    Used = ALIGN_VALUE (PolicyAddress + PolicySize, SIZE_16KB) - Address;
+    if (Addon != NULL) {
+      AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
+      PolicyAddress = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB);
+    } else {
+      AddonAddress = 0;
+      PolicyAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
+    }
+    if (Policies == NULL) { PolicyAddress = 0; }
+    Used = ALIGN_VALUE ((PolicyAddress != 0) ? (PolicyAddress + PolicySize) :
+                        ((AddonAddress != 0) ? (AddonAddress + AddonSize) :
+                         (TrustCacheAddress + TrustCacheSize)), SIZE_16KB) - Address;
   }
   UnicodeSPrint (Diag, sizeof (Diag), L"IMG 0x%lx ADD 0x%lx POL 0x%lx RAM 0x%lx",
                  (UINT64)(UINTN)Image, AddonAddress, PolicyAddress, RamdiskAddress);
-  DiagDraw (Diag, 6);
-  gBS->Stall (3000000);
+  UnicodeSPrint (Diag, sizeof (Diag), L"USED 0x%lx LIM 0x%lx",
+                 Used, Address + WindowSize);
   if (Used > WindowSize - BLOCK_SIZE) {
     Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
     Status = EFI_BAD_BUFFER_SIZE;
     goto Fail;
   }
-  ZeroMem ((VOID *)(UINTN)Address, (UINTN)Used);
+  ZeroMem ((VOID *)(UINTN)ArgsAddress, sizeof (DARWIN_BOOT_ARGS));
   for (Index = 0; Index < Kernel.Count; Index++) {
     CopyMem ((VOID *)(UINTN)(Address + Kernel.Segments[Index].Address - Kernel.Base),
              (UINT8 *)Image + Kernel.Segments[Index].FileOffset, (UINTN)Kernel.Segments[Index].FileSize);
+    if (Kernel.Segments[Index].Size > Kernel.Segments[Index].FileSize) {
+      ZeroMem ((VOID *)(UINTN)(Address + Kernel.Segments[Index].Address - Kernel.Base +
+                             Kernel.Segments[Index].FileSize),
+               (UINTN)(Kernel.Segments[Index].Size - Kernel.Segments[Index].FileSize));
+    }
   }
   Args = (DARWIN_BOOT_ARGS *)(UINTN)ArgsAddress;
   Args->Revision = 2;
@@ -1072,7 +1100,7 @@ Boot (
   }
   CopyMem (Args->CommandLine, CommandLine, sizeof (CommandLine));
   CopyMem ((VOID *)(UINTN)TreeAddress, Tree, TreeSize);
-  if (Request->Ramdisk != NULL) {
+  if ((Request->Ramdisk != NULL) && (RamdiskOffset != MAX_UINTN) && (RamdiskAddress != 0)) {
     if (!LowSidecars) {
       if (KeepPacked) { CopyMem ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize); }
       else { CopyRamdisk ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize, RamdiskPacked); }
@@ -1080,85 +1108,60 @@ Boot (
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + RamdiskOffset), RamdiskAddress);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + RamdiskOffset + 8), RamdiskBytes);
   }
-  if (TrustCaches != NULL) {
+  if ((TrustCaches != NULL) && (TrustCacheOffset != MAX_UINTN)) {
     CopyMem ((VOID *)(UINTN)TrustCacheAddress, TrustCaches, TrustCacheSize);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + TrustCacheOffset), TrustCacheAddress);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + TrustCacheOffset + 8), TrustCacheSize);
-    FreePool (TrustCaches); TrustCaches = NULL;
+    TrustCaches = NULL;
   }
-  if (AddonAddress != 0) {
+  if ((AddonAddress != 0) && (AddonOffset != MAX_UINTN) && (Addon != NULL)) {
+    CopyMem ((VOID *)(UINTN)AddonAddress, Addon, AddonSize);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset), AddonAddress);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset + 8), AddonSize);
-    if (Addon != NULL) {
-      CopyMem ((VOID *)(UINTN)AddonAddress, Addon, AddonSize);
-      FreePool (Addon); Addon = NULL;
-    }
+    FreePool (Addon); Addon = NULL;
   }
-  if (PolicyAddress != 0) {
+  if ((PolicyAddress != 0) && (PolicyOffset != MAX_UINTN) && (Policies != NULL)) {
+    CopyMem ((VOID *)(UINTN)PolicyAddress, Policies, PolicySize);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + PolicyOffset), PolicyAddress);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + PolicyOffset + 8), PolicySize);
-    if (Policies != NULL) {
-      CopyMem ((VOID *)(UINTN)PolicyAddress, Policies, PolicySize);
-      FreePool (Policies); Policies = NULL;
-    }
+    FreePool (Policies); Policies = NULL;
   }
-  DiagDraw (L"COPY DONE", 7);
-  gBS->Stall (3000000);
-  FreePool (Image); Image = NULL;
-  FreePool (Tree); Tree = NULL;
+  Tree = NULL;
   FreePool (TreePath); TreePath = NULL;
   Root->Close (Root); Root = NULL;
   Status = GetMap (&Map, &Capacity, &MapSize, &Key, &Stride);
   if (EFI_ERROR (Status)) { goto Fail; }
-  Print (L"DARWINBOOT: ARM64 va=0x%lx pa=0x%lx args=0x%lx entry=0x%lx owned=0x%lx\n",
-         Kernel.Base, Address, ArgsAddress, Address + Kernel.Entry - Kernel.Base, (UINT64)WindowSize);
-  Print (L"DARWINBOOT: video base=0x%lx display=%lu row=%lu width=%lu height=%lu depth=%lu\n",
-         Video[0], Video[1], Video[2], Video[3], Video[4], Video[5]);
-  Print (L"DARWINBOOT: zap base=0x%lx size=0x%lx\n", ZapAddress, (UINT64)(2 * SIZE_1MB));
-  Print (L"DARWINBOOT: command line: %a\n", CommandLine);
-  Print (L"DARWINBOOT: inputs validated; exiting boot services\n");
 
-  //
-  // The same facts in large type over the whole screen. The firmware's log
-  // draws far larger than the text console, and the form feed clears the
-  // screen first. This is what stays visible if the kernel never draws.
-  //
-  DEBUG ((DEBUG_ERROR, "\fDARWINBOOT: hand-off to the kernel\n\n"));
-  DEBUG ((DEBUG_ERROR, "kernel   va 0x%lx  pa 0x%lx\n", Kernel.Base, Address));
-  DEBUG ((DEBUG_ERROR, "entry    pa 0x%lx\n", Address + Kernel.Entry - Kernel.Base));
-  DEBUG ((DEBUG_ERROR, "args     pa 0x%lx  window 0x%lx bytes\n", ArgsAddress, (UINT64)WindowSize));
-  DEBUG ((DEBUG_ERROR, "video    base 0x%lx  %lux%lu  row %lu bytes  %lu bpp\n", Video[0], Video[3], Video[4], Video[2], Video[5]));
-  DEBUG ((DEBUG_ERROR, "entry words %08x %08x %08x %08x\n",
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base)),
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 4)),
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 8)),
-          ReadUnaligned32 ((CONST UINT32 *)(UINTN)(Address + Kernel.Entry - Kernel.Base + 12))));
-  DEBUG ((DEBUG_ERROR, "CurrentEL %lu  SCTLR_EL1 0x%lx  TCR_EL1 0x%lx\n", DarwinCurrentEl () >> 2, READ_SYSREG (sctlr_el1), READ_SYSREG (tcr_el1)));
-  DEBUG ((DEBUG_ERROR, "ID_AA64MMFR0_EL1 0x%lx  (PARange %lu, 4 KiB granule %a)\n", READ_SYSREG (id_aa64mmfr0_el1),
-          READ_SYSREG (id_aa64mmfr0_el1) & 0xF, (((READ_SYSREG (id_aa64mmfr0_el1) >> 28) & 0xF) == 0xF) ? "NOT supported" : "supported"));
-  DEBUG ((DEBUG_ERROR, "ID_AA64PFR0_EL1  0x%lx\n", READ_SYSREG (id_aa64pfr0_el1)));
-  DEBUG ((DEBUG_ERROR, "\nExiting boot services. A green bar across the top\nmarks the loader handoff before the kernel branch.\n"));
   for (Attempt = 0; Attempt < 3; Attempt++) {
     MapSize = Capacity;
     Status = gBS->GetMemoryMap (&MapSize, Map, &Key, &Stride, &Version);
     if (EFI_ERROR (Status)) {
       if (Attempt == 0) { goto Fail; }
-      CpuDeadLoop ();
+      break;
     }
     Status = gBS->ExitBootServices (mImage, Key);
     if (!EFI_ERROR (Status)) {
       DarwinEnter (ArgsAddress, Address + Kernel.Entry - Kernel.Base, Address, WindowSize, Video[0], Video[2] * Video[4]);
       CpuDeadLoop ();
     }
-    if (Status != EFI_INVALID_PARAMETER) { CpuDeadLoop (); }
+    if (Status != EFI_INVALID_PARAMETER) { break; }
   }
+  /*
+   * H236ce: if ExitBootServices never succeeds, nothing after this point can
+   * use the console, so report it in the large direct-framebuffer font. This
+   * is a failure diagnostic only; the success path draws nothing but the
+   * thin handoff checkpoint in Entry.S.
+   */
+  UnicodeSPrint (Diag, sizeof (Diag), L"NO EBS %r try %lu key %lu",
+                 Status, (UINT64)Attempt, (UINT64)Key);
+  DiagDraw (Diag, 1);
   CpuDeadLoop ();
   return EFI_ABORTED;
 Fail:
   if (Root != NULL) { Root->Close (Root); }
-  if (Image != NULL) { FreePool (Image); }
-  if (Tree != NULL) { FreePool (Tree); }
-  if (TrustCaches != NULL) { FreePool (TrustCaches); }
+  FreeLow (&ImageAlloc);
+  FreeLow (&TreeAlloc);
+  FreeLow (&TrustAlloc);
   if (Addon != NULL) { FreePool (Addon); }
   if (Policies != NULL) { FreePool (Policies); }
   if (TreePath != NULL) { FreePool (TreePath); }
