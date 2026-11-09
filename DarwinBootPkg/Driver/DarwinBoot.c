@@ -1132,10 +1132,20 @@ Boot (
   CopyMem (Args->Video, Video, sizeof (Video));
   Args->DeviceTree = Kernel.Base + TreeAddress - Address;
   Args->DeviceTreeLength = (UINT32)TreeSize;
-  if (AsciiStrLen (CommandLine) + 32 < sizeof (CommandLine)) {
-    AsciiSPrint (CommandLine + AsciiStrLen (CommandLine),
-                 sizeof (CommandLine) - AsciiStrLen (CommandLine),
-                 " zap-base=0x%lx", ZapAddress);
+  {
+    /*
+     * H236cv: the payload command line is already ~997 characters, so the old
+     * "+ 32 < sizeof" test refused to append zap-base and NativeA540C3 logged
+     * "zap-base missing or invalid: 0". Measure the formatted argument instead.
+     */
+    CHAR8  ZapArg[32];
+    UINTN  ZapLength;
+
+    AsciiSPrint (ZapArg, sizeof (ZapArg), " zap-base=0x%lx", ZapAddress);
+    ZapLength = AsciiStrLen (CommandLine);
+    if (ZapLength + AsciiStrLen (ZapArg) < sizeof (CommandLine)) {
+      CopyMem (CommandLine + ZapLength, ZapArg, AsciiStrLen (ZapArg) + 1);
+    }
   }
   CopyMem (Args->CommandLine, CommandLine, sizeof (CommandLine));
   CopyMem ((VOID *)(UINTN)TreeAddress, Tree, TreeSize);
