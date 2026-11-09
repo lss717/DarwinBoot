@@ -11,6 +11,7 @@
 #include <Protocol/UniXNULoader.h>
 #include <Protocol/LoadedImage.h>
 #include <Protocol/GraphicsOutput.h>
+#include <Protocol/Cpu.h>
 #include <Protocol/SimpleFileSystem.h>
 #include "BootArgs.h"
 #include "BootVideo.h"
@@ -638,6 +639,107 @@ AllocateWindow (KERNEL *Kernel, UINT64 WindowSize, EFI_PHYSICAL_ADDRESS *Address
   return Status;
 }
 
+/*
+ * H236bv: sagit-ios-port's stageZap recipe. Allocate below 4 GiB with
+ * AllocateMaxAddress, over-allocate by (alignment - 4096) so the base can be
+ * aligned inside the reservation, and lower the limit if the aligned range
+ * would cross 4 GiB. The ZAP buffer is outside the kernel window; only the
+ * boot stage reserves it.
+ */
+typedef struct {
+  UINT64  Raw;
+  UINT64  Total;
+  UINT64  Address;
+  UINT64  Usable;
+} LOW_ALLOC;
+
+STATIC
+VOID
+FreeLow (
+  LOW_ALLOC *Alloc
+  )
+{
+  if ((Alloc != NULL) && (Alloc->Raw != 0) && (Alloc->Total != 0)) {
+    gBS->FreePages (Alloc->Raw, EFI_SIZE_TO_PAGES (Alloc->Total));
+  }
+  if (Alloc != NULL) {
+    ZeroMem (Alloc, sizeof (*Alloc));
+  }
+}
+
+STATIC
+EFI_STATUS
+AllocateLow (
+  UINT64     Usable,
+  UINT64     Alignment,
+  UINT64     Attributes,
+  BOOLEAN    Zero,
+  LOW_ALLOC  *Alloc
+  )
+{
+  EFI_STATUS             Status;
+  EFI_CPU_ARCH_PROTOCOL  *Cpu;
+  EFI_PHYSICAL_ADDRESS   Raw;
+  UINT64                 Total;
+  UINT64                 Limit;
+  UINT64                 Aligned;
+  UINTN                  Attempt;
+
+  if ((Alloc == NULL) || (Usable == 0) || (Alignment < EFI_PAGE_SIZE) ||
+      ((Alignment & (Alignment - 1)) != 0) ||
+      (Usable > MAX_UINT64 - Alignment + EFI_PAGE_SIZE)) {
+    return EFI_INVALID_PARAMETER;
+  }
+  ZeroMem (Alloc, sizeof (*Alloc));
+  Total = Usable + Alignment - EFI_PAGE_SIZE;
+  Cpu = NULL;
+  if (Attributes != 0) {
+    EFI_GUID  CpuGuid = EFI_CPU_ARCH_PROTOCOL_GUID;
+    Status = gBS->LocateProtocol (&CpuGuid, NULL, (VOID **)&Cpu);
+    if (EFI_ERROR (Status)) { Cpu = NULL; }
+  }
+  Limit = 0xFFFFFFFFULL;
+  for (Attempt = 0; Attempt < 64; Attempt++) {
+    Raw = Limit;
+    Status = gBS->AllocatePages (AllocateMaxAddress, EfiLoaderData,
+                                 EFI_SIZE_TO_PAGES (Total), &Raw);
+    if (EFI_ERROR (Status)) { return Status; }
+    Aligned = ALIGN_VALUE (Raw, Alignment);
+    if ((Aligned < Raw) || (Aligned - Raw > Total) ||
+        (Usable > Total - (Aligned - Raw)) ||
+        (Aligned > 0xFFFFFFFFULL) || (Usable > 0x100000000ULL - Aligned)) {
+      gBS->FreePages (Raw, EFI_SIZE_TO_PAGES (Total));
+      if (Raw < Alignment) { break; }
+      Limit = Raw - 1;
+      continue;
+    }
+    if (Cpu != NULL) {
+      Status = Cpu->FlushDataCache (Cpu, Raw, Total, EfiCpuFlushTypeWriteBackInvalidate);
+      if (EFI_ERROR (Status)) {
+        gBS->FreePages (Raw, EFI_SIZE_TO_PAGES (Total));
+        return Status;
+      }
+      if (Attributes != 0) {
+        Status = Cpu->SetMemoryAttributes (Cpu, Raw, Total, Attributes);
+        if (EFI_ERROR (Status)) {
+          Cpu->SetMemoryAttributes (Cpu, Raw, Total, EFI_MEMORY_WB);
+          gBS->FreePages (Raw, EFI_SIZE_TO_PAGES (Total));
+          return Status;
+        }
+      }
+    }
+    if (Zero) { ZeroMem ((VOID *)(UINTN)Aligned, (UINTN)Usable); }
+    Alloc->Raw = Raw;
+    Alloc->Total = Total;
+    Alloc->Address = Aligned;
+    Alloc->Usable = Usable;
+    Print (L"DARWINBOOT: low alloc base=0x%lx raw=0x%lx total=0x%lx\n",
+           Aligned, Raw, Total);
+    return EFI_SUCCESS;
+  }
+  return EFI_OUT_OF_RESOURCES;
+}
+
 STATIC
 EFI_STATUS
 EFIAPI
@@ -682,6 +784,12 @@ Boot (
   UINTN                           PolicyOffset;
   UINT64                          PolicyAddress;
   UINT64                          ZapAddress;
+  LOW_ALLOC                       ZapAlloc;
+  LOW_ALLOC                       RamdiskAlloc;
+  LOW_ALLOC                       AddonAlloc;
+  LOW_ALLOC                       PolicyAlloc;
+  BOOLEAN                         LowSidecars;
+  UINT64                          InitialWindow;
   DARWIN_BOOT_ARGS                *Args;
   EFI_MEMORY_DESCRIPTOR           *Map;
   UINTN                           Capacity;
@@ -728,6 +836,12 @@ Boot (
   Map = NULL;
   Address = 0;
   Capacity = 0;
+  ZeroMem (&ZapAlloc, sizeof (ZapAlloc));
+  ZeroMem (&RamdiskAlloc, sizeof (RamdiskAlloc));
+  ZeroMem (&AddonAlloc, sizeof (AddonAlloc));
+  ZeroMem (&PolicyAlloc, sizeof (PolicyAlloc));
+  LowSidecars = FALSE;
+  InitialWindow = 0;
   Status = gBS->HandleProtocol (Request->Volume, &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs);
   if (EFI_ERROR (Status)) { return Status; }
   Status = Fs->OpenVolume (Fs, &Root);
@@ -753,7 +867,7 @@ Boot (
   if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
-  if (WindowSize > (128ULL * 1024 * 1024)) { WindowSize = 128ULL * 1024 * 1024; }
+  if (WindowSize > (192ULL * 1024 * 1024)) { WindowSize = 192ULL * 1024 * 1024; }
   if (Kernel.Base > MAX_UINT64 - WindowSize) { Status = EFI_LOAD_ERROR; goto Fail; }
   if (Request->Ramdisk != NULL) {
     if ((RamdiskOffset == MAX_UINTN) || (U64 ((UINT8 *)Tree + RamdiskOffset) != 0) ||
@@ -815,7 +929,36 @@ Boot (
   }
   Status = ReadBootVideo (Video);
   if (EFI_ERROR (Status)) { goto Fail; }
+
+  /*
+   * H236bv: reserve the ZAP image outside the XNU arena, using sagit's
+   * stageZap recipe (AllocateMaxAddress < 4 GiB, over-allocate by alignment,
+   * align inside the reservation, then UC/XP). The kernel maps this through
+   * zap-base; it is not part of the kernel window.
+   */
+  Status = AllocateLow (2 * SIZE_1MB, SIZE_1MB,
+                        EFI_MEMORY_UC | EFI_MEMORY_XP, TRUE, &ZapAlloc);
+  if (EFI_ERROR (Status)) {
+    UnicodeSPrint (Diag, sizeof (Diag), L"NO ZAP ALLOC %r", Status);
+    DiagDraw (Diag, 2);
+    gBS->Stall (15000000);
+    goto Fail;
+  }
+  ZapAddress = ZapAlloc.Address;
+
+  /*
+   * Try 192 MiB first; if the firmware's per-call limit is 128 MiB, retry at
+   * 128 MiB and put the ramdisk/addon/policy below 4 GiB. The ZAP already
+   * stays outside either window.
+   */
+  InitialWindow = WindowSize;
   Status = AllocateWindow (&Kernel, WindowSize, &Address);
+  if (EFI_ERROR (Status) && (InitialWindow > (128ULL * 1024 * 1024))) {
+    WindowSize = 128ULL * 1024 * 1024;
+    ZeroMem (&Address, sizeof (Address));
+    Status = AllocateWindow (&Kernel, WindowSize, &Address);
+    if (!EFI_ERROR (Status)) { LowSidecars = TRUE; }
+  }
   if (EFI_ERROR (Status)) {
     UnicodeSPrint (Diag, sizeof (Diag), L"NO KERNEL WINDOW %r size=0x%lx", Status, WindowSize);
     DiagDraw (Diag, 1);
@@ -824,27 +967,66 @@ Boot (
   }
   ArgsAddress = ALIGN_VALUE (Address + Kernel.End - Kernel.Base, SIZE_16KB);
   TreeAddress = ArgsAddress + EFI_PAGE_SIZE;
-  TrustCacheAddress = ALIGN_VALUE (TreeAddress + TreeSize, SIZE_16KB);
-  /*
-   * H236bu: 256 MiB AllocatePages fails on this firmware, but the 76 MiB
-   * payload pool succeeds. Keep only kernel/args/tree/trust/ZAP in a 128 MiB
-   * window; the large ramdisk/addon/policy sidecars stay in their pools.
-   */
-  RamdiskAddress = (UINT64)(UINTN)Request->Ramdisk;
-  RamdiskBytes = Request->RamdiskSize;
-  AddonAddress = (UINT64)(UINTN)Addon;
-  PolicyAddress = (UINT64)(UINTN)Policies;
-  /* The A540 ZAP image (.b02, p_align=1 MiB) needs a low 1 MiB-aligned base. */
-  ZapAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_1MB);
-  if ((ZapAddress < TrustCacheAddress) || (ZapAddress + 2 * SIZE_1MB > 0x100000000ULL)) {
-    UnicodeSPrint (Diag, sizeof (Diag), L"NO ZAP base=0x%lx trust=0x%lx",
-                   ZapAddress, TrustCacheAddress);
-    DiagDraw (Diag, 2);
-    gBS->Stall (15000000);
-    Status = EFI_BAD_BUFFER_SIZE;
-    goto Fail;
+  if (LowSidecars) {
+    TrustCacheAddress = ALIGN_VALUE (TreeAddress + TreeSize, SIZE_16KB);
+    if (Request->Ramdisk != NULL) {
+      Status = AllocateLow (KeepPacked ? Request->RamdiskSize : RamdiskExpandedSize,
+                            EFI_PAGE_SIZE, 0, FALSE, &RamdiskAlloc);
+      if (EFI_ERROR (Status)) {
+        UnicodeSPrint (Diag, sizeof (Diag), L"NO RAMDISK LOW %r", Status);
+        DiagDraw (Diag, 3);
+        gBS->Stall (15000000);
+        goto Fail;
+      }
+      if (KeepPacked) {
+        CopyMem ((VOID *)(UINTN)RamdiskAlloc.Address, Request->Ramdisk, Request->RamdiskSize);
+      } else {
+        CopyRamdisk ((VOID *)(UINTN)RamdiskAlloc.Address, Request->Ramdisk,
+                     Request->RamdiskSize, RamdiskPacked);
+      }
+      RamdiskAddress = RamdiskAlloc.Address;
+      RamdiskBytes = RamdiskAlloc.Usable;
+    } else {
+      RamdiskAddress = 0;
+      RamdiskBytes = 0;
+    }
+    if (Addon != NULL) {
+      Status = AllocateLow (AddonSize, EFI_PAGE_SIZE, 0, FALSE, &AddonAlloc);
+      if (EFI_ERROR (Status)) {
+        UnicodeSPrint (Diag, sizeof (Diag), L"NO ADDON LOW %r", Status);
+        DiagDraw (Diag, 3);
+        gBS->Stall (15000000);
+        goto Fail;
+      }
+      CopyMem ((VOID *)(UINTN)AddonAlloc.Address, Addon, AddonSize);
+      AddonAddress = AddonAlloc.Address;
+      FreePool (Addon); Addon = NULL;
+    } else {
+      AddonAddress = 0;
+    }
+    if (Policies != NULL) {
+      Status = AllocateLow (PolicySize, EFI_PAGE_SIZE, 0, FALSE, &PolicyAlloc);
+      if (EFI_ERROR (Status)) {
+        UnicodeSPrint (Diag, sizeof (Diag), L"NO POLICY LOW %r", Status);
+        DiagDraw (Diag, 3);
+        gBS->Stall (15000000);
+        goto Fail;
+      }
+      CopyMem ((VOID *)(UINTN)PolicyAlloc.Address, Policies, PolicySize);
+      PolicyAddress = PolicyAlloc.Address;
+      FreePool (Policies); Policies = NULL;
+    } else {
+      PolicyAddress = 0;
+    }
+    Used = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB) - Address;
+  } else {
+    RamdiskAddress = ALIGN_VALUE (TreeAddress + TreeSize, EFI_PAGE_SIZE);
+    RamdiskBytes = ALIGN_VALUE (KeepPacked ? Request->RamdiskSize : RamdiskExpandedSize, EFI_PAGE_SIZE);
+    TrustCacheAddress = RamdiskAddress + RamdiskBytes;
+    AddonAddress = ALIGN_VALUE (TrustCacheAddress + TrustCacheSize, SIZE_16KB);
+    PolicyAddress = ALIGN_VALUE (AddonAddress + AddonSize, SIZE_16KB);
+    Used = ALIGN_VALUE (PolicyAddress + PolicySize, SIZE_16KB) - Address;
   }
-  Used = ALIGN_VALUE (ZapAddress + 2 * SIZE_1MB, SIZE_16KB) - Address;
   if (Used > WindowSize - BLOCK_SIZE) {
     Print (L"DARWINBOOT: used %lu window %lu kernel %lu ramdisk %lu\n", (UINT64)Used, (UINT64)WindowSize, (UINT64)(Kernel.End - Kernel.Base), (UINT64)RamdiskBytes);
     Status = EFI_BAD_BUFFER_SIZE;
@@ -874,26 +1056,34 @@ Boot (
   CopyMem (Args->CommandLine, CommandLine, sizeof (CommandLine));
   CopyMem ((VOID *)(UINTN)TreeAddress, Tree, TreeSize);
   if (Request->Ramdisk != NULL) {
-    /* Already a live EfiLoaderData pool; the XNU ramdisk uses it in place. */
+    if (!LowSidecars) {
+      if (KeepPacked) { CopyMem ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize); }
+      else { CopyRamdisk ((VOID *)(UINTN)RamdiskAddress, Request->Ramdisk, Request->RamdiskSize, RamdiskPacked); }
+    }
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + RamdiskOffset), RamdiskAddress);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + RamdiskOffset + 8), RamdiskBytes);
   }
-  (VOID)CopyRamdisk;
   if (TrustCaches != NULL) {
     CopyMem ((VOID *)(UINTN)TrustCacheAddress, TrustCaches, TrustCacheSize);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + TrustCacheOffset), TrustCacheAddress);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + TrustCacheOffset + 8), TrustCacheSize);
     FreePool (TrustCaches); TrustCaches = NULL;
   }
-  if (Addon != NULL) {
-    /* Live EfiLoaderData pool outside the kernel window. */
+  if (AddonAddress != 0) {
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset), AddonAddress);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + AddonOffset + 8), AddonSize);
+    if (Addon != NULL) {
+      CopyMem ((VOID *)(UINTN)AddonAddress, Addon, AddonSize);
+      FreePool (Addon); Addon = NULL;
+    }
   }
-  if (Policies != NULL) {
-    /* Live EfiLoaderData pool outside the kernel window. */
+  if (PolicyAddress != 0) {
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + PolicyOffset), PolicyAddress);
     WriteUnaligned64 ((UINT64 *)(UINTN)(TreeAddress + PolicyOffset + 8), PolicySize);
+    if (Policies != NULL) {
+      CopyMem ((VOID *)(UINTN)PolicyAddress, Policies, PolicySize);
+      FreePool (Policies); Policies = NULL;
+    }
   }
   FreePool (Image); Image = NULL;
   FreePool (Tree); Tree = NULL;
@@ -954,6 +1144,10 @@ Fail:
   if (Policies != NULL) { FreePool (Policies); }
   if (TreePath != NULL) { FreePool (TreePath); }
   if (Map != NULL) { FreePool (Map); }
+  FreeLow (&RamdiskAlloc);
+  FreeLow (&AddonAlloc);
+  FreeLow (&PolicyAlloc);
+  FreeLow (&ZapAlloc);
   if (Address != 0) { gBS->FreePages (Address, EFI_SIZE_TO_PAGES (WindowSize)); }
   Print (L"DARWINBOOT: boot refused: %r; firmware retained\n", Status);
   return Status;
