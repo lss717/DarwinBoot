@@ -828,12 +828,14 @@ Boot (
   DARWIN_LOADER_INPUT             Inputs[DARWIN_INPUT_COUNT];
 
   (VOID)This;
+  Print (L"DARWINBOOT: stage=request\n");
   if ((Request == NULL) || (Request->Volume == NULL) || (Request->KernelPath == NULL)) { return EFI_INVALID_PARAMETER; }
   if ((Request->KextCount != 0) || (Request->DeviceTree != NULL) || (Request->DeviceTreeSize != 0) ||
       (DarwinCurrentEl () != 4)) {
     Print (L"DARWINBOOT: unsupported inputs or exception level; firmware retained\n");
     return EFI_UNSUPPORTED;
   }
+  Print (L"DARWINBOOT: stage=ramdisk-layout\n");
   if (!RamdiskLayout (Request->Ramdisk, Request->RamdiskSize, &RamdiskExpandedSize, &RamdiskPacked)) {
     Print (L"DARWINBOOT: ramdisk layout rejected, %lu bytes\n", (UINT64)Request->RamdiskSize);
     return EFI_BAD_BUFFER_SIZE;
@@ -864,12 +866,16 @@ Boot (
   Excluded = NULL;
   ExcludedCount = 0;
   Capacity = 0;
+  Print (L"DARWINBOOT: stage=open-volume\n");
   Status = gBS->HandleProtocol (Request->Volume, &gEfiSimpleFileSystemProtocolGuid, (VOID **)&Fs);
   if (EFI_ERROR (Status)) { return Status; }
   Status = Fs->OpenVolume (Fs, &Root);
   if (EFI_ERROR (Status)) { return Status; }
+  Print (L"DARWINBOOT: stage=read-kernel\n");
   Status = ReadFile (Root, Request->KernelPath, KERNEL_LIMIT, &Image, &ImageSize);
   if (EFI_ERROR (Status)) { goto Fail; }
+  Print (L"DARWINBOOT: stage=parse-kernel image=0x%lx size=0x%lx\n",
+         (UINT64)(UINTN)Image, (UINT64)ImageSize);
   Status = ParseKernel (Image, ImageSize, &Kernel);
   if (EFI_ERROR (Status)) { goto Fail; }
   Length = StrSize (Request->KernelPath);
@@ -877,6 +883,7 @@ Boot (
   if (TreePath == NULL) { Status = EFI_OUT_OF_RESOURCES; goto Fail; }
   CopyMem (TreePath, Request->KernelPath, Length);
   StrCatS (TreePath, Length / sizeof (CHAR16) + 11, L".adt");
+  Print (L"DARWINBOOT: stage=read-adt\n");
   Status = ReadFile (Root, TreePath, SIZE_16MB, &Tree, &TreeSize);
   if (EFI_ERROR (Status)) { goto Fail; }
   Offset = 0;
@@ -892,6 +899,8 @@ Boot (
   OutsideOffset = MAX_UINTN;
   OutsideCapacity = 0;
   if (!FindOutsideTable (Tree, TreeSize, &OutsideOffset, &OutsideCapacity)) { OutsideOffset = MAX_UINTN; }
+  Print (L"DARWINBOOT: stage=parse-adt tree=0x%lx size=0x%lx\n",
+         (UINT64)(UINTN)Tree, (UINT64)TreeSize);
   if (!AdtNode (Tree, TreeSize, &Offset, 0, 3, &RamdiskOffset, &TrustCacheOffset, &AddonOffset, &PolicyOffset, &WindowSize, &KeepPacked, &ExcludedOffset, &ExcludedCapacity, &InputsOffset) || (Offset != TreeSize)) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (KeepPacked && (!RamdiskPacked || (RamdiskOffset == MAX_UINTN))) { Status = EFI_COMPROMISED_DATA; goto Fail; }
   if (WindowSize == 0) { WindowSize = WINDOW_SIZE; }
@@ -954,9 +963,11 @@ Boot (
     Status = EFI_COMPROMISED_DATA;
     goto Fail;
   }
+  Print (L"DARWINBOOT: stage=read-video\n");
   Status = ReadBootVideo (Video);
   if (EFI_ERROR (Status)) { goto Fail; }
   RamdiskBytes = ALIGN_VALUE (KeepPacked ? Request->RamdiskSize : RamdiskExpandedSize, EFI_PAGE_SIZE);
+  Print (L"DARWINBOOT: stage=allocate-window size=0x%lx\n", (UINT64)WindowSize);
   if (ExcludedOffset == MAX_UINTN) {
     Status = AllocateWindow (&Kernel, WindowSize, &Address);
     Allocated = WindowSize;
@@ -967,6 +978,8 @@ Boot (
     Allocated = HeadSize;
   }
   if (EFI_ERROR (Status)) { goto Fail; }
+  Print (L"DARWINBOOT: stage=place-image pa=0x%lx bytes=0x%lx\n",
+         (UINT64)Address, (UINT64)Allocated);
   PlaceImage (Address, &Kernel, TreeSize, RamdiskBytes, TrustCacheSize, AddonSize, PolicySize, &Layout);
   ArgsAddress = Layout.Args;
   TreeAddress = Layout.Tree;
@@ -980,6 +993,7 @@ Boot (
     Status = EFI_BAD_BUFFER_SIZE;
     goto Fail;
   }
+  Print (L"DARWINBOOT: stage=copy-kernel used=0x%lx\n", (UINT64)Used);
   ZeroMem ((VOID *)(UINTN)Address, (UINTN)Used);
   for (Index = 0; Index < Kernel.Count; Index++) {
     CopyMem ((VOID *)(UINTN)(Address + Kernel.Segments[Index].Address - Kernel.Base),
