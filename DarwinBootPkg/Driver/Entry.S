@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: BSD-2-Clause-Patent
-#include <AsmMacroLib.h>
+#include <AsmMacroIoLib.h>
 
 ASM_FUNC(DarwinCurrentEl)
   mrs x0, CurrentEL
