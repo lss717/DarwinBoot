@@ -12,7 +12,7 @@ BASE = 0xfffffff007004000
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('output', type=Path)
-    parser.add_argument('--memory-size', type=lambda value: int(value, 0), choices=[0x10000000, 0x20000000])
+    parser.add_argument('--memory-size', type=lambda value: int(value, 0), choices=[0x08000000, 0x10000000, 0x20000000])
     parser.add_argument('--gop', action='store_true')
     args = parser.parse_args()
     output = args.output.resolve()

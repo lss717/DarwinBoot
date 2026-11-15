@@ -4,6 +4,6 @@
 // Allocation still requires one real conventional-memory run. This is a
 // parser bound, never a declaration of available RAM or an allocation fallback.
 static inline int DarwinWindowSizeValid(unsigned long long size) {
-  return size >= 0x10000000ULL && size <= 0x200000000ULL && !(size & 0x1fffffULL);
+  return size >= 0x08000000ULL && size <= 0x200000000ULL && !(size & 0x1fffffULL);
 }
 #endif
