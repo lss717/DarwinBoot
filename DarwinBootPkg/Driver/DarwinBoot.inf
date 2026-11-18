@@ -16,6 +16,7 @@
   Entry.S
 
 [Packages]
+  ArmPkg/ArmPkg.dec
   MdePkg/MdePkg.dec
   UniXNUPkg/UniXNUPkg.dec
 
